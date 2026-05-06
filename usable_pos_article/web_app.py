@@ -35,9 +35,13 @@ def analyze_video():
             summary, estimates, _, _ = extract_article_style_pos(video_path=input_path)
             payload = {
                 "summary": asdict(summary),
-                "windows": [asdict(estimate) for estimate in estimates],
+                "windows": [
+                    {k: (None if isinstance(v, float) and v != v else v) for k, v in asdict(estimate).items()}
+                    for estimate in estimates
+                ],
             }
             return jsonify(payload)
+
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
