@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
+import os
 
 from flask import Flask, jsonify, render_template, request
 from werkzeug.utils import secure_filename
@@ -11,6 +12,7 @@ from article_pos_pipeline import extract_article_style_pos
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+DEFAULT_MAX_FRAMES = int(os.getenv("MAX_ANALYZE_FRAMES", "450"))
 
 
 @app.get("/")
@@ -32,16 +34,16 @@ def analyze_video():
             input_path = Path(tmp_dir) / f"input{suffix}"
             file.save(input_path)
 
-            summary, estimates, _, _ = extract_article_style_pos(video_path=input_path)
+            summary, estimates, _, _ = extract_article_style_pos(
+                video_path=input_path,
+                max_frames=DEFAULT_MAX_FRAMES,
+            )
             payload = {
                 "summary": asdict(summary),
-                "windows": [
-                    {k: (None if isinstance(v, float) and v != v else v) for k, v in asdict(estimate).items()}
-                    for estimate in estimates
-                ],
+                "windows": [asdict(estimate) for estimate in estimates],
+                "limits": {"max_frames": DEFAULT_MAX_FRAMES},
             }
             return jsonify(payload)
-
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
