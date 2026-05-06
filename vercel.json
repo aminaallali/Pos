@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "usable_pos_article/web_app.py", "use": "@vercel/python" }
+  ],
+  "functions": {
+    "usable_pos_article/web_app.py": {
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    { "src": "/(.*)", "dest": "usable_pos_article/web_app.py" }
+  ]
+}
