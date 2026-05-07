@@ -111,8 +111,12 @@ image = (
         "python-multipart==0.0.12",
         "requests==2.32.3",
     )
-    .add_local_python_source("article_pos_pipeline")
+    # Build steps that don't need the local source must come BEFORE
+    # ``add_local_python_source``. Modal rejects an Image whose final layer is
+    # an ``add_local_*`` followed by another build step, because that would
+    # invalidate the build cache on every local edit.
     .run_function(_prefetch_face_landmarker_model)
+    .add_local_python_source("article_pos_pipeline")
 )
 
 app = modal.App(APP_NAME, image=image)
