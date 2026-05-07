@@ -224,7 +224,7 @@ python client_example.py from-url --url "$BASE_URL" --video-url https://example.
 * The container is configured with `cpu=2.0`, `memory=4096`, and
   `@modal.concurrent(max_inputs=4)` so a single replica handles bursts; Modal
   autoscales replicas under load.
-* The MediaPipe `face_landmarker.task` model is baked into the image at build
+* The MediaPipe `face_landmarker.task` model is fetched lazily on first request inside the container at build
   time (`run_function(_prefetch_face_landmarker_model)`), so the first
   request after a cold start does not download it.
 

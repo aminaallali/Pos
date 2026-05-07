@@ -71,12 +71,6 @@ import modal
 
 APP_NAME = "pos-rppg-bpm"
 
-FACE_LANDMARKER_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/1/face_landmarker.task"
-)
-MODEL_CACHE_PATH = "/root/.cache/article_pos_pipeline/face_landmarker.task"
-
 # The processing function caps the request body at this size. Larger uploads
 # should use ``/analyze-url`` so Modal streams the bytes directly from object
 # storage.
@@ -85,18 +79,6 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 # Hard ceiling on how long a single request is allowed to run. Long videos can
 # be expensive; clients should pass ``max_frames`` to keep latency bounded.
 REQUEST_TIMEOUT_SECONDS = 600
-
-
-def _prefetch_face_landmarker_model() -> None:
-    """Download the MediaPipe face landmarker model into the image."""
-    import urllib.request
-    from pathlib import Path
-
-    target = Path(MODEL_CACHE_PATH)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists() and target.stat().st_size > 0:
-        return
-    urllib.request.urlretrieve(FACE_LANDMARKER_URL, target)
 
 
 image = (
@@ -111,11 +93,8 @@ image = (
         "python-multipart==0.0.12",
         "requests==2.32.3",
     )
-    # Build steps that don't need the local source must come BEFORE
-    # ``add_local_python_source``. Modal rejects an Image whose final layer is
-    # an ``add_local_*`` followed by another build step, because that would
-    # invalidate the build cache on every local edit.
-    .run_function(_prefetch_face_landmarker_model)
+    # ``add_local_*`` must be the final layer in the chain (Modal rejects
+    # Images that have any non-add_local_* build step after one).
     .add_local_python_source("article_pos_pipeline")
 )
 
