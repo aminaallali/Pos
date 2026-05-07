@@ -243,7 +243,13 @@ def fastapi_app():
 
         summary_dict = asdict(summary)
         summary_dict.pop("video", None)
-        windows = [asdict(estimate) for estimate in estimates]
+        windows = [
+            {
+                k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+                for k, v in asdict(estimate).items()
+            }
+            for estimate in estimates
+        ]
         return {
             "bpm": summary_dict.get("median_bpm"),
             "summary": summary_dict,
