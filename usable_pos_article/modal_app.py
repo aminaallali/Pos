@@ -125,6 +125,7 @@ def fastapi_app():
     """Build and return the FastAPI application served by Modal."""
     import base64
     import binascii
+    import math
     import tempfile
     from dataclasses import asdict
     from pathlib import Path
