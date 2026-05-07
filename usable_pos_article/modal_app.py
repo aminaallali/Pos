@@ -64,7 +64,7 @@ They all return the same JSON schema::
     }
 """
 
-from __future__ import annotations
+import math
 
 import modal
 
