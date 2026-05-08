@@ -308,6 +308,74 @@ def rgb_from_mask(
     return pixels.mean(axis=0).astype(np.float64)
 
 
+def _resample_to_uniform_grid(
+    trace: np.ndarray,
+    timestamps_s: np.ndarray,
+    fallback_fps: float,
+) -> tuple[np.ndarray, float]:
+    """Resample a per-frame trace onto a uniform time grid.
+
+    Phone-recorded videos are very often variable-frame-rate: the camera
+    drops or doubles up frames, but ``cv2.VideoCapture.get(CAP_PROP_FPS)``
+    only exposes a single nominal rate. Treating that nominal rate as the
+    true sampling rate stretches the spectrum and shifts the BPM peak. We
+    use the per-frame ``CAP_PROP_POS_MSEC`` timestamps to detect the actual
+    median frame interval and resample the trace onto that uniform grid.
+
+    ``trace`` may be 2-D ``(frames, channels)`` or 3-D
+    ``(frames, estimators, channels)``. If the timestamps are unusable
+    (all zero, non-monotonic, or too few distinct values), the original
+    trace and ``fallback_fps`` are returned unchanged.
+    """
+    timestamps_s = np.asarray(timestamps_s, dtype=np.float64)
+    if timestamps_s.size != trace.shape[0] or timestamps_s.size < 2:
+        return trace, fallback_fps
+
+    # Some backends report POS_MSEC as non-strictly-monotonic on the first
+    # few frames; force monotonicity before computing dt.
+    timestamps_s = np.maximum.accumulate(timestamps_s)
+    diffs = np.diff(timestamps_s)
+    valid_diffs = diffs[diffs > 0]
+    if valid_diffs.size < max(2, trace.shape[0] // 4):
+        return trace, fallback_fps
+
+    median_dt = float(np.median(valid_diffs))
+    if median_dt <= 0 or not math.isfinite(median_dt):
+        return trace, fallback_fps
+    target_fps = 1.0 / median_dt
+    span = float(timestamps_s[-1] - timestamps_s[0])
+    if span <= 0 or not math.isfinite(target_fps):
+        return trace, fallback_fps
+
+    n_new = max(2, int(round(span * target_fps)) + 1)
+    new_ts = timestamps_s[0] + np.arange(n_new, dtype=np.float64) / target_fps
+
+    if trace.ndim == 2:
+        resampled = np.empty((n_new, trace.shape[1]), dtype=np.float64)
+        for c in range(trace.shape[1]):
+            resampled[:, c] = np.interp(new_ts, timestamps_s, trace[:, c])
+        return resampled, target_fps
+
+    if trace.ndim == 3:
+        n_frames, n_est, n_ch = trace.shape
+        flat = trace.reshape(n_frames, -1)
+        out_flat = np.empty((n_new, flat.shape[1]), dtype=np.float64)
+        for col in range(flat.shape[1]):
+            y = flat[:, col]
+            finite = np.isfinite(y)
+            if not np.any(finite):
+                out_flat[:, col] = np.nan
+            elif finite.all():
+                out_flat[:, col] = np.interp(new_ts, timestamps_s, y)
+            else:
+                out_flat[:, col] = np.interp(
+                    new_ts, timestamps_s[finite], y[finite]
+                )
+        return out_flat.reshape(n_new, n_est, n_ch), target_fps
+
+    return trace, fallback_fps
+
+
 def read_rgb_trace(
     video_path: Path,
     roi_mode: str,
@@ -325,6 +393,7 @@ def read_rgb_trace(
 
     processor = FaceMeshProcessor()
     rgb_values: list[np.ndarray] = []
+    timestamps: list[float] = []
     frames_read = 0
     frames_with_face = 0
 
@@ -332,6 +401,8 @@ def read_rgb_trace(
         while True:
             if max_frames is not None and frames_read >= max_frames:
                 break
+            # POS_MSEC before read() = time of the frame about to be read.
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -357,13 +428,17 @@ def read_rgb_trace(
 
             if rgb is not None and np.all(np.isfinite(rgb)):
                 rgb_values.append(rgb)
+                timestamps.append(pos_msec / 1000.0)
     finally:
         processor.close()
         cap.release()
 
     if not rgb_values:
         raise RuntimeError("No valid RGB samples were extracted. Check video visibility and face detection.")
-    return np.vstack(rgb_values), fps, frames_read, frames_with_face
+    rgb_arr = np.vstack(rgb_values)
+    ts_arr = np.asarray(timestamps, dtype=np.float64)
+    rgb_resampled, effective_fps = _resample_to_uniform_grid(rgb_arr, ts_arr, fps)
+    return rgb_resampled, effective_fps, frames_read, frames_with_face
 
 
 def read_patch_estimator_trace(
@@ -381,6 +456,7 @@ def read_patch_estimator_trace(
 
     processor = FaceMeshProcessor()
     traces: list[np.ndarray] = []
+    timestamps: list[float] = []
     frames_read = 0
     frames_with_face = 0
 
@@ -388,6 +464,8 @@ def read_patch_estimator_trace(
         while True:
             if max_frames is not None and frames_read >= max_frames:
                 break
+            # POS_MSEC before read() = time of the frame about to be read.
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -402,13 +480,17 @@ def read_patch_estimator_trace(
             estimators = patch_rgb_estimators(frame_rgb, landmarks, patch_size=patch_size)
             if estimators is not None:
                 traces.append(estimators)
+                timestamps.append(pos_msec / 1000.0)
     finally:
         processor.close()
         cap.release()
 
     if not traces:
         raise RuntimeError("No valid patch RGB samples were extracted. Check video visibility and face detection.")
-    return np.stack(traces, axis=0), fps, frames_read, frames_with_face
+    trace_arr = np.stack(traces, axis=0)
+    ts_arr = np.asarray(timestamps, dtype=np.float64)
+    trace_resampled, effective_fps = _resample_to_uniform_grid(trace_arr, ts_arr, fps)
+    return trace_resampled, effective_fps, frames_read, frames_with_face
 
 
 def bandpass_filter(signal: np.ndarray, fps: float, min_hz: float, max_hz: float, order: int = 6) -> np.ndarray:
@@ -495,8 +577,11 @@ def article_style_patch_bvp(
         if np.std(rgb) <= np.finfo(np.float64).eps:
             continue
         try:
-            rgb_filtered = bandpass_filter(rgb, fps, min_hz, max_hz)
-            bvp = pos_bvp(rgb_filtered, fps)
+            # POS is illumination-invariant by construction (the c / mean(c)
+            # step), so the paper applies the bandpass *only* after POS.
+            # Filtering the RGB beforehand strips the DC component POS uses
+            # to compute the chrominance projection cleanly.
+            bvp = pos_bvp(rgb, fps)
             bvp = bandpass_filter(bvp, fps, min_hz, max_hz)
         except ValueError:
             continue
@@ -529,8 +614,23 @@ def estimate_window_bpm(
     candidates = np.where((freqs >= min_hz) & (freqs <= max_hz))[0]
     if candidates.size == 0:
         return float("nan"), float("nan"), False
-    peak_idx = candidates[np.argmax(psd[candidates])]
+    peak_idx = int(candidates[np.argmax(psd[candidates])])
     peak_hz = float(freqs[peak_idx])
+
+    # 3-point parabolic interpolation around the PSD peak gives sub-bin
+    # frequency resolution. Without it, the maximum achievable BPM
+    # resolution is the bin width fps / nperseg, which for an 8 s window at
+    # 30 fps is 0.125 Hz = 7.5 BPM.
+    if 0 < peak_idx < len(psd) - 1:
+        p0, p1, p2 = float(psd[peak_idx - 1]), float(psd[peak_idx]), float(psd[peak_idx + 1])
+        denom = p0 - 2.0 * p1 + p2
+        if denom != 0.0:
+            delta = 0.5 * (p0 - p2) / denom
+            if -1.0 < delta < 1.0:
+                df = float(freqs[1] - freqs[0])
+                refined = peak_hz + delta * df
+                if min_hz <= refined <= max_hz:
+                    peak_hz = refined
     return peak_hz * 60.0, peak_hz, True
 
 
