@@ -169,11 +169,31 @@ def fastapi_app():
     ALLOWED_ROI = {"face", "selected", "full-frame"}
     ALLOWED_RGB = {"patches", "mask"}
 
+    # When a user clicks "Try it out" → "Execute" in Swagger UI without filling
+    # in the optional fields, Swagger submits the schema's *placeholder* as the
+    # actual value (e.g. ``roi_mode=string``, ``patch_size=0``). None of these
+    # placeholder values are valid for any field below, so treat them as
+    # "not provided" and fall back to the documented defaults.
+    SWAGGER_PLACEHOLDERS: dict[str, set[Any]] = {
+        "roi_mode": {"", "string"},
+        "rgb_mode": {"", "string"},
+        "patch_size": {0},
+        "window_seconds": {0, 0.0},
+        "stride_seconds": {0, 0.0},
+        "min_hz": {0, 0.0},
+        "max_hz": {0, 0.0},
+        "max_frames": {0},
+    }
+
     def _validated_options(raw: dict[str, Any]) -> dict[str, Any]:
         opts = {**DEFAULTS}
         for key in DEFAULTS:
-            if key in raw and raw[key] is not None:
-                opts[key] = raw[key]
+            if key not in raw:
+                continue
+            value = raw[key]
+            if value is None or value in SWAGGER_PLACEHOLDERS.get(key, set()):
+                continue
+            opts[key] = value
 
         if opts["roi_mode"] not in ALLOWED_ROI:
             raise HTTPException(
