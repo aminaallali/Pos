@@ -28,12 +28,20 @@ All ``/analyze*`` endpoints accept the same optional tuning parameters either
 as form fields (``/analyze``) or as JSON keys (``/analyze-url``,
 ``/analyze-base64``):
 
-* ``method``         - ``auto`` | ``tscan`` | ``pos`` (default ``auto``).
+* ``method``         - ``auto`` | ``tscan`` | ``pos`` | ``consensus``
+                       (default ``auto``).
                        ``auto`` runs the TS-CAN neural pipeline first and
                        falls back to article-style POS only if TS-CAN cannot
                        be loaded or the clip is shorter than ~4 s. ``tscan``
                        forces the neural path; ``pos`` forces the legacy
                        POS path (the original ``/analyze`` behaviour).
+                       ``consensus`` runs all 7 classical rPPG algorithms
+                       (POS, CHROM, GREEN, ICA, LGI, PBV, OMIT) in parallel
+                       and combines them with the rPPG-VQA frequency-
+                       consistency + spectral-correlation weighting,
+                       returning a unified BPM, a quality score ``q_sig``
+                       in [0, 1], an ``accepted`` / ``rejected`` verdict,
+                       and a per-algorithm breakdown.
 * ``roi_mode``       - ``face`` | ``selected`` | ``full-frame`` (default ``face``).
                        Only used by the POS path.
 * ``rgb_mode``       - ``patches`` | ``mask`` (default ``patches``).
@@ -99,6 +107,12 @@ image = (
     .pip_install(
         "numpy<2.0",
         "scipy==1.13.1",
+        # ``scikit-learn`` is used by ``consensus_inference.py`` for the
+        # FastICA blind-source-separation step (replaces the rPPG-Toolbox
+        # JADE implementation, which relies on ``np.matrix`` semantics that
+        # broke in numpy 2.0). When unavailable the consensus falls back
+        # to whitened-PCA, but FastICA matches the rPPG-VQA paper.
+        "scikit-learn==1.5.2",
         "opencv-python-headless==4.10.0.84",
         "mediapipe==0.10.14",
         "fastapi[standard]==0.115.4",
@@ -116,7 +130,9 @@ image = (
     )
     # ``add_local_*`` must be the final layer in the chain (Modal rejects
     # Images that have any non-add_local_* build step after one).
-    .add_local_python_source("article_pos_pipeline", "tscan_inference")
+    .add_local_python_source(
+        "article_pos_pipeline", "tscan_inference", "consensus_inference"
+    )
     # Bundle the pretrained TS-CAN checkpoint and license attribution into
     # the image. ``/root`` is the working directory in Modal containers,
     # which is where ``add_local_python_source`` puts the modules above; we
@@ -175,11 +191,14 @@ def fastapi_app():
     web_app = FastAPI(
         title="POS rPPG BPM API",
         description=(
-            "Estimate heart rate (BPM) from a face video using the "
-            "Plane-Orthogonal-to-Skin (POS) rPPG algorithm "
-            "(Wang et al., IEEE TBME 2017)."
+            "Estimate heart rate (BPM) from a face video. Defaults to the "
+            "TS-CAN neural rPPG path; ``method=pos`` for the article-style "
+            "Plane-Orthogonal-to-Skin POS pipeline (Wang et al., IEEE TBME "
+            "2017); ``method=consensus`` for the rPPG-VQA-style multi-method "
+            "aggregator that runs 7 classical algorithms in parallel and "
+            "reports a unified BPM plus a signal-quality score."
         ),
-        version="1.0.0",
+        version="1.2.0",
     )
 
     web_app.add_middleware(
@@ -201,7 +220,7 @@ def fastapi_app():
         "max_frames": None,
     }
 
-    ALLOWED_METHOD = {"auto", "tscan", "pos"}
+    ALLOWED_METHOD = {"auto", "tscan", "pos", "consensus"}
     ALLOWED_ROI = {"face", "selected", "full-frame"}
     ALLOWED_RGB = {"patches", "mask"}
 
@@ -265,6 +284,19 @@ def fastapi_app():
                 opts["method"] = "pos"
                 method_inferred_from = triggers
         opts["_method_inferred_from"] = method_inferred_from
+
+        # When the caller picks consensus and leaves the cardiac band at the
+        # documented (POS-tuned) defaults, narrow the band to the rPPG-VQA
+        # recommendation [0.7, 2.5] Hz / [42, 150] BPM. The classical
+        # algorithms in the consensus produce broader spectra than TS-CAN
+        # and pick up subharmonics or 2nd harmonics outside the cardiac
+        # band when ``max_hz`` is left at 4.0 Hz, which destroys the
+        # cross-algorithm agreement.
+        if opts["method"] == "consensus":
+            if "min_hz" not in user_provided:
+                opts["min_hz"] = 0.7
+            if "max_hz" not in user_provided:
+                opts["max_hz"] = 2.5
 
         if opts["method"] not in ALLOWED_METHOD:
             raise HTTPException(
@@ -342,11 +374,23 @@ def fastapi_app():
             }
             for estimate in estimates
         ]
+        # Lift consensus-only fields out of summary into top-level keys for
+        # easy client consumption. Leave them in summary as well so the
+        # full ExtractionSummary stays serializable.
         response: dict[str, Any] = {
             "bpm": summary_dict.get("median_bpm"),
             "summary": summary_dict,
             "windows": windows,
         }
+        if summary.method == "consensus":
+            response["q_sig"] = summary.q_sig
+            response["consensus_verdict"] = summary.consensus_verdict
+            response["consensus_inliers"] = summary.consensus_inliers
+            response["inlier_std_bpm"] = summary.inlier_std_bpm
+            response["consensus_rejection_reason"] = (
+                summary.consensus_rejection_reason
+            )
+            response["per_algorithm"] = summary.consensus_methods
         if method_inferred_from:
             # Tell the caller we honoured their POS-only fields by routing
             # to the POS path, even though they didn't set ``method=pos``
@@ -380,14 +424,17 @@ def fastapi_app():
     def root() -> dict[str, Any]:
         return {
             "service": "POS rPPG BPM API",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "algorithm": (
                 "Hybrid: TS-CAN neural rPPG (Liu et al., NeurIPS 2020, "
                 "UBFC-rPPG pretrained checkpoint from rPPG-Toolbox) as "
                 "the default method, with article-style "
                 "Plane-Orthogonal-to-Skin (POS) rPPG "
                 "(Wang et al., IEEE TBME 2017) as the fallback / "
-                "explicit-opt-in method."
+                "explicit-opt-in method, plus a consensus method that "
+                "runs 7 classical rPPG algorithms in parallel and "
+                "combines them via rPPG-VQA-style frequency-consistency "
+                "and spectral-correlation weighting."
             ),
             "endpoints": {
                 "GET /": "this metadata",

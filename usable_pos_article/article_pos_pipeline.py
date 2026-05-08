@@ -101,10 +101,22 @@ class ExtractionSummary:
     # New fields (kept at the end so existing JSON consumers are unaffected).
     # ``method`` records which BVP extractor produced the result — "pos" for
     # the original article-style POS pipeline, "tscan" for the TS-CAN neural
-    # method. ``fallback_reason`` is set when ``method="auto"`` was requested
-    # but had to fall back from TS-CAN to POS (e.g. clip too short).
+    # method, or "consensus" for the multi-method rPPG-VQA aggregator.
+    # ``fallback_reason`` is set when ``method="auto"`` was requested but had
+    # to fall back from TS-CAN to POS (e.g. clip too short).
     method: str | None = None
     fallback_reason: str | None = None
+    # Consensus-only fields. Populated only when ``method="consensus"``.
+    # ``q_sig`` is the unified signal-quality score in [0, 1] (Eq. 4 / 8 of
+    # rPPG-VQA). ``consensus_verdict`` is "accepted" or "rejected".
+    # ``consensus_methods`` is a per-algorithm breakdown the API surfaces
+    # alongside the headline BPM.
+    q_sig: float | None = None
+    consensus_verdict: str | None = None
+    consensus_inliers: int | None = None
+    inlier_std_bpm: float | None = None
+    consensus_rejection_reason: str | None = None
+    consensus_methods: list[dict] | None = None
 
 
 class FaceMeshProcessor:
@@ -862,6 +874,119 @@ def _extract_via_tscan(
     return summary, estimates, rgb_trace, bvp
 
 
+def _extract_via_consensus(
+    video_path: Path,
+    roi_mode: str,
+    rgb_mode: str,
+    patch_size: int,
+    min_hz: float,
+    max_hz: float,
+    window_seconds: float,
+    stride_seconds: float,
+    max_frames: int | None,
+) -> tuple[ExtractionSummary, list[WindowEstimate], np.ndarray, np.ndarray]:
+    """Run the rPPG-VQA-style multi-method consensus pipeline.
+
+    Reuses :func:`read_rgb_trace` (with the caller's ROI / RGB-mode choices)
+    to produce a uniform-grid RGB trace, then hands it to
+    :func:`consensus_inference.consensus_bpm` which runs all seven classical
+    algorithms (POS, CHROM, GREEN, ICA, LGI, PBV, OMIT) and combines them via
+    the frequency-consistency + spectral-correlation weighting scheme.
+
+    Returns the same four-tuple as the other backends. The headline BPM and
+    quality fields end up in ``summary``; ``estimates`` contains a single
+    whole-clip ``WindowEstimate`` so existing per-window UI keeps working.
+    """
+    try:
+        from . import consensus_inference  # type: ignore[import-not-found]
+    except ImportError:
+        import consensus_inference  # type: ignore[import-not-found,no-redef]
+
+    # When the caller wants per-patch processing, run each consensus
+    # algorithm on every face-skin patch independently and median-aggregate
+    # across patches \u2014 this lifts the same motion robustness that the
+    # article-style POS pipeline already enjoys onto every classical method
+    # in the consensus.
+    patch_trace: np.ndarray | None = None
+    if rgb_mode == "patches":
+        patch_trace, fps, frames_read, frames_with_face = read_patch_estimator_trace(
+            video_path=video_path,
+            patch_size=patch_size,
+            max_frames=max_frames,
+        )
+        rgb = interpolate_nans(np.nanmean(patch_trace, axis=1))
+    else:
+        rgb, fps, frames_read, frames_with_face = read_rgb_trace(
+            video_path=video_path,
+            roi_mode=roi_mode,
+            rgb_mode=rgb_mode,
+            patch_size=patch_size,
+            max_frames=max_frames,
+        )
+        rgb = interpolate_nans(rgb)
+
+    result = consensus_inference.consensus_bpm(
+        rgb=rgb,
+        fps=fps,
+        min_hz=min_hz,
+        max_hz=max_hz,
+        patch_trace=patch_trace,
+    )
+
+    bpm = float(result.bpm) if math.isfinite(result.bpm) else float("nan")
+    valid = bool(math.isfinite(bpm) and bpm > 0)
+    duration = rgb.shape[0] / max(fps, 1e-6)
+    estimates = [
+        WindowEstimate(
+            start_s=0.0,
+            center_s=duration / 2.0,
+            end_s=duration,
+            bpm=bpm,
+            peak_hz=bpm / 60.0 if math.isfinite(bpm) else float("nan"),
+            valid=valid,
+        )
+    ]
+    summary = ExtractionSummary(
+        video=str(video_path),
+        fps=fps,
+        frames_read=frames_read,
+        frames_with_face=frames_with_face,
+        roi_mode=roi_mode,
+        rgb_mode=rgb_mode,
+        patch_size=patch_size,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        min_hz=min_hz,
+        max_hz=max_hz,
+        mean_bpm=bpm if valid else None,
+        median_bpm=bpm if valid else None,
+        valid_windows=int(valid),
+        total_windows=1,
+        method="consensus",
+        q_sig=float(result.q_sig),
+        consensus_verdict=result.verdict,
+        consensus_inliers=result.consensus_inliers,
+        inlier_std_bpm=float(result.inlier_std_bpm),
+        consensus_rejection_reason=result.rejection_reason,
+        consensus_methods=[
+            {
+                "name": m.name,
+                "bpm": float(m.bpm) if math.isfinite(m.bpm) else None,
+                "snr_db": (
+                    float(m.snr_db) if math.isfinite(m.snr_db) else None
+                ),
+                "weight": float(m.weight),
+                "weight_freq": float(m.weight_freq),
+                "weight_corr": float(m.weight_corr),
+                "inlier": bool(m.inlier),
+                "error": m.error,
+            }
+            for m in result.methods
+        ],
+    )
+    return summary, estimates, rgb, np.zeros(rgb.shape[0])
+
+
 def extract_bpm(
     video_path: Path,
     method: str = "auto",
@@ -891,6 +1016,11 @@ def extract_bpm(
       records the reason in ``summary.fallback_reason``.
     * ``"tscan"``: run TS-CAN and surface any error.
     * ``"pos"``: run the existing :func:`extract_article_style_pos` only.
+    * ``"consensus"``: run all seven classical rPPG algorithms (POS, CHROM,
+      GREEN, ICA, LGI, PBV, OMIT) on the same RGB trace and combine them
+      with the rPPG-VQA frequency-consistency + spectral-correlation
+      weighting. Surfaces a ``q_sig`` quality score and a per-algorithm
+      breakdown alongside the headline BPM.
 
     The return shape is identical to :func:`extract_article_style_pos`: the
     new ``method`` and ``fallback_reason`` fields on
@@ -898,9 +1028,23 @@ def extract_bpm(
     answer.
     """
     method = method or "auto"
-    if method not in {"auto", "tscan", "pos"}:
+    if method not in {"auto", "tscan", "pos", "consensus"}:
         raise ValueError(
-            f"method must be one of {{'auto', 'tscan', 'pos'}}; got {method!r}"
+            f"method must be one of "
+            f"{{'auto', 'tscan', 'pos', 'consensus'}}; got {method!r}"
+        )
+
+    if method == "consensus":
+        return _extract_via_consensus(
+            video_path=video_path,
+            roi_mode=roi_mode,
+            rgb_mode=rgb_mode,
+            patch_size=patch_size,
+            min_hz=min_hz,
+            max_hz=max_hz,
+            window_seconds=window_seconds,
+            stride_seconds=stride_seconds,
+            max_frames=max_frames,
         )
 
     fallback_reason: str | None = None
