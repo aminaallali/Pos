@@ -101,7 +101,18 @@ image = (
 app = modal.App(APP_NAME, image=image)
 
 
-@app.function(timeout=REQUEST_TIMEOUT_SECONDS, memory=4096, cpu=2.0)
+@app.function(
+    timeout=REQUEST_TIMEOUT_SECONDS,
+    memory=2048,
+    cpu=1.0,
+    # Keep one container warm so we don't pay the ~30 s mediapipe/opencv
+    # cold start on every fresh request after idle. Set to 0 if you want
+    # pure scale-to-zero (cheaper, but the first request after idle blocks
+    # for the cold start).
+    min_containers=1,
+    # Keep an idle container alive for 10 min before scaling to zero.
+    scaledown_window=600,
+)
 @modal.concurrent(max_inputs=4)
 @modal.asgi_app()
 def fastapi_app():
