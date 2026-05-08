@@ -662,8 +662,12 @@ def extract_article_style_pos(
             max_frames=max_frames,
         )
         rgb = interpolate_nans(rgb)
-        rgb_filtered = bandpass_filter(rgb, fps, min_hz, max_hz)
-        bvp = pos_bvp(rgb_filtered, fps)
+        # POS is illumination-invariant by construction (the c / mean(c)
+        # step), so the paper applies the bandpass *only* after POS.
+        # Filtering the RGB beforehand strips the DC component POS uses
+        # to compute the chrominance projection cleanly. Same change as in
+        # article_style_patch_bvp above; applies to rgb_mode="mask" here.
+        bvp = pos_bvp(rgb, fps)
         bvp = bandpass_filter(bvp, fps, min_hz, max_hz)
 
     window_frames = int(round(window_seconds * fps))
