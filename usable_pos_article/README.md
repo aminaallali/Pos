@@ -221,12 +221,17 @@ python client_example.py from-url --url "$BASE_URL" --video-url https://example.
   Larger payloads should use `/analyze-url`.
 * `REQUEST_TIMEOUT_SECONDS = 600`. To keep tail latency bounded, pass
   `max_frames` (e.g. analyze a rolling 30 s window for live calls).
-* The container is configured with `cpu=2.0`, `memory=4096`, and
-  `@modal.concurrent(max_inputs=4)` so a single replica handles bursts; Modal
-  autoscales replicas under load.
-* The MediaPipe `face_landmarker.task` model is fetched lazily on first request inside the container at build
-  time (`run_function(_prefetch_face_landmarker_model)`), so the first
-  request after a cold start does not download it.
+* The container is configured with `cpu=1.0`, `memory=2048`,
+  `min_containers=1`, `scaledown_window=600`, and
+  `@modal.concurrent(max_inputs=4)` so a single replica handles bursts and
+  one container stays warm to avoid cold starts; Modal autoscales replicas
+  under load.
+* The MediaPipe `face_landmarker.task` model is downloaded lazily on the
+  first request inside each container (cached at
+  `~/.cache/article_pos_pipeline/face_landmarker.task`), so the first
+  request after a cold start adds a few seconds of one-time download
+  latency. Subsequent requests on the same container reuse the cached
+  model.
 
 ## Important scientific limitations
 
