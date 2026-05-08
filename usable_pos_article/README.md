@@ -264,27 +264,29 @@ classical algorithms have broader spectra than TS-CAN and would
 otherwise pick up subharmonics or 2nd harmonics outside the cardiac
 band, destroying cross-algorithm agreement.
 
-Consensus-specific response fields (top-level + `summary`):
+Consensus-specific response fields. The same scalars are exposed both at
+the **top level** of the JSON (for clients that don't want to dig into
+`summary`) and inside `summary` (for parity with the other methods):
 
-| Field                       | Type   | Description                                                                                                                  |
-|-----------------------------|--------|------------------------------------------------------------------------------------------------------------------------------|
-| `summary.method`            | string | `consensus`                                                                                                                  |
-| `summary.q_sig`             | float  | Signal-level quality score in `[0, 1]`. Mean combined weight across inliers. Higher = stronger consensus.                    |
-| `summary.consensus_verdict` | string | `accepted` (≥ 2 inliers agree within 5 BPM) or `rejected`.                                                                   |
-| `summary.consensus_inliers` | int    | Number of algorithms in the inlier set.                                                                                      |
-| `summary.n_methods_succeeded`| int   | Number of algorithms that ran without error (out of 7).                                                                      |
-| `summary.inlier_mean_snr_db`| float  | Mean SNR (dB) across the inlier algorithms — useful as a finer-grained quality cutoff if the binary verdict isn't enough.    |
-| `methods`                   | list   | Per-algorithm breakdown: `[{name, bpm, snr_db, weight_freq, weight_corr, weight, inlier, error}]`.                           |
+| Field                                                       | Type   | Description                                                                                                                |
+|-------------------------------------------------------------|--------|----------------------------------------------------------------------------------------------------------------------------|
+| `summary.method`                                            | string | `consensus`.                                                                                                               |
+| `q_sig` / `summary.q_sig`                                   | float  | Signal-level quality score in `[0, 1]`. Mean combined weight across inliers. Higher = stronger consensus.                  |
+| `consensus_verdict` / `summary.consensus_verdict`           | string | `accepted` (≥ 2 inliers agree within 5 BPM) or `rejected`.                                                                 |
+| `consensus_inliers` / `summary.consensus_inliers`           | int    | Number of algorithms in the inlier set.                                                                                    |
+| `inlier_std_bpm` / `summary.inlier_std_bpm`                 | float  | BPM standard deviation across the inlier set — useful as a finer-grained quality cutoff than the binary verdict.           |
+| `consensus_rejection_reason` / `summary.consensus_rejection_reason` | string \| null | Human-readable reason when the verdict is `rejected` (e.g. `"only 1 inlier"`, `"all algorithms failed"`); `null` on accept. |
+| `per_algorithm` (top-level) / `summary.consensus_methods`   | list   | Per-algorithm breakdown: `[{name, bpm, snr_db, weight_freq, weight_corr, weight, inlier, error}]` — one entry per algorithm. |
 
-Local benchmark on the user-provided test clip
-`lv_0_20260508141911.mp4` (truth `92–94 BPM`, hard for single-algorithm
-methods):
+Live benchmark (Modal `/analyze`, `method=consensus`, defaults) on the
+user-provided test clip `lv_0_20260508141911.mp4` (truth `92–94 BPM`,
+hard for single-algorithm methods):
 
-| `method`    | `bpm`  | verdict   | notes                                                            |
-|-------------|-------:|-----------|------------------------------------------------------------------|
-| `tscan`     | 94.92  | n/a       | Default; no tuning required.                                     |
-| `pos` (`max_hz=2.5`) | 93.67 | n/a | Best of the legacy classical paths, still needs band tuning.    |
-| `consensus` | 91.44  | accepted  | 2/7 inliers (POS + CHROM); `q_sig ≈ 0.27`. ~0.6 BPM off truth.   |
+| `method`             | `bpm`  | verdict   | notes                                                                            |
+|----------------------|-------:|-----------|----------------------------------------------------------------------------------|
+| `tscan`              | 94.92  | n/a       | Default; no tuning required.                                                     |
+| `pos` (`max_hz=2.5`) | 93.67  | n/a       | Best of the legacy classical paths, still needs band tuning.                     |
+| `consensus`          | 92.97  | accepted  | 3/7 inliers (POS=93.17, CHROM=93.39, LGI=92.45); `inlier_std_bpm = 0.40`; `q_sig ≈ 0.49`. |
 
 > **When to use which method?**
 > - `auto` / `tscan` for the lowest tail latency and the most robust
