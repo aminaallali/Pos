@@ -104,9 +104,13 @@ image = (
         "fastapi[standard]==0.115.4",
         "python-multipart==0.0.12",
         "requests==2.32.3",
-        # PyTorch CPU build for the TS-CAN neural rPPG path. The CPU wheel
-        # is ~250 MB; we install it from the public CPU index to avoid
-        # pulling the 2 GB CUDA build.
+    )
+    # PyTorch CPU build for the TS-CAN neural rPPG path, installed in a
+    # separate layer because Modal's ``extra_options`` is applied to the
+    # whole pip command — the PyTorch CPU index only hosts torch wheels,
+    # so chaining it with the install above would 404 fastapi/mediapipe.
+    # The CPU wheel is ~250 MB vs. ~2 GB for the CUDA build.
+    .pip_install(
         "torch==2.4.1",
         extra_options="--index-url https://download.pytorch.org/whl/cpu",
     )
