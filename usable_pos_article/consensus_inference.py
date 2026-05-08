@@ -308,21 +308,37 @@ _ALGO_FNS: dict[str, Callable[[np.ndarray, float], np.ndarray]] = {
 def _parabolic_peak_hz(freqs: np.ndarray, psd: np.ndarray) -> float:
     """3-point parabolic interpolation around the PSD peak, mirroring the
     refinement in ``article_pos_pipeline.estimate_window_bpm``.
+
+    Mirrors the reference implementation's two safety checks:
+
+    - ``-1.0 < delta < 1.0`` — a near-zero ``denom`` (flat or noisy PSD)
+      can otherwise produce a huge ``delta`` that shifts the reported
+      peak by several bins.
+    - The refined frequency is clamped to the input ``freqs`` band; if
+      the interpolation would push the peak outside the band we keep
+      the unrefined integer-bin peak.
     """
     if psd.size == 0:
         return 0.0
     k = int(np.argmax(psd))
     if k == 0 or k == psd.size - 1:
         return float(freqs[k])
-    y0 = psd[k - 1]
-    y1 = psd[k]
-    y2 = psd[k + 1]
-    denom = (y0 - 2.0 * y1 + y2)
+    y0 = float(psd[k - 1])
+    y1 = float(psd[k])
+    y2 = float(psd[k + 1])
+    denom = y0 - 2.0 * y1 + y2
     if abs(denom) < 1e-12:
         return float(freqs[k])
     delta = 0.5 * (y0 - y2) / denom
-    df = freqs[1] - freqs[0]
-    return float(freqs[k] + delta * df)
+    if not (-1.0 < delta < 1.0):
+        return float(freqs[k])
+    df = float(freqs[1] - freqs[0])
+    refined = float(freqs[k]) + delta * df
+    lo = float(freqs[0])
+    hi = float(freqs[-1])
+    if lo <= refined <= hi:
+        return refined
+    return float(freqs[k])
 
 
 def _bvp_to_hr_psd_snr(
