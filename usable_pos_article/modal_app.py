@@ -205,6 +205,20 @@ def fastapi_app():
     ALLOWED_ROI = {"face", "selected", "full-frame"}
     ALLOWED_RGB = {"patches", "mask"}
 
+    # Fields that only the POS path consumes. When the caller leaves
+    # ``method`` at its default ``auto`` but explicitly sets one of these,
+    # we infer they actually want the POS pipeline (otherwise the API
+    # silently runs TS-CAN and ignores their setting, which is confusing —
+    # see PR #4 user feedback). ``min_hz`` / ``max_hz`` belong here too
+    # because the TS-CAN path uses a fixed band internally.
+    POS_ONLY_FIELDS = {
+        "roi_mode",
+        "rgb_mode",
+        "patch_size",
+        "min_hz",
+        "max_hz",
+    }
+
     # When a user clicks "Try it out" → "Execute" in Swagger UI without filling
     # in the optional fields, Swagger submits the schema's *placeholder* as the
     # actual value (e.g. ``method=string``, ``patch_size=0``). None of these
@@ -224,6 +238,12 @@ def fastapi_app():
 
     def _validated_options(raw: dict[str, Any]) -> dict[str, Any]:
         opts = {**DEFAULTS}
+        # Track which fields the caller actually provided (not None / not a
+        # Swagger placeholder). We use this below to infer ``method=pos``
+        # when the user has touched a POS-only field but left ``method`` at
+        # the default.
+        user_provided: set[str] = set()
+        method_explicit = False
         for key in DEFAULTS:
             if key not in raw:
                 continue
@@ -231,6 +251,20 @@ def fastapi_app():
             if value is None or value in SWAGGER_PLACEHOLDERS.get(key, set()):
                 continue
             opts[key] = value
+            user_provided.add(key)
+            if key == "method":
+                method_explicit = True
+
+        # If the caller explicitly set a POS-only field but didn't pick a
+        # method, run POS with their settings rather than silently routing
+        # the call through TS-CAN (which ignores those fields).
+        method_inferred_from: list[str] | None = None
+        if not method_explicit:
+            triggers = sorted(POS_ONLY_FIELDS & user_provided)
+            if triggers:
+                opts["method"] = "pos"
+                method_inferred_from = triggers
+        opts["_method_inferred_from"] = method_inferred_from
 
         if opts["method"] not in ALLOWED_METHOD:
             raise HTTPException(
@@ -280,6 +314,7 @@ def fastapi_app():
         return opts
 
     def _run_pipeline(video_path: Path, opts: dict[str, Any]) -> dict[str, Any]:
+        method_inferred_from = opts.pop("_method_inferred_from", None)
         try:
             summary, estimates, _, _ = extract_bpm(
                 video_path=video_path,
@@ -307,11 +342,19 @@ def fastapi_app():
             }
             for estimate in estimates
         ]
-        return {
+        response: dict[str, Any] = {
             "bpm": summary_dict.get("median_bpm"),
             "summary": summary_dict,
             "windows": windows,
         }
+        if method_inferred_from:
+            # Tell the caller we honoured their POS-only fields by routing
+            # to the POS path, even though they didn't set ``method=pos``
+            # explicitly. This lets clients distinguish "I asked for
+            # auto and TS-CAN ran" from "I asked for auto-but-with-rgb_mode
+            # and POS ran".
+            response["method_inferred_from"] = method_inferred_from
+        return response
 
     def _save_to_tempfile(data: bytes, suffix: str = ".mp4") -> Path:
         if not data:

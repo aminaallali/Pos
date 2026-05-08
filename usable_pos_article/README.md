@@ -183,6 +183,16 @@ on `/analyze`, JSON keys on the others):
 | `max_hz`         | float   | `4.0`     | POS-only. Upper band-pass / PSD bound. TS-CAN uses a fixed `[0.75, 2.5] Hz` band internally. |
 | `max_frames`     | int     | _none_    | Cap on processed frames (latency control).                                                   |
 
+> **Implicit method=pos**: if you leave `method` at the default but
+> explicitly set any POS-only field (`roi_mode`, `rgb_mode`, `patch_size`,
+> `min_hz`, or `max_hz`), the API runs the POS pipeline with your
+> settings rather than silently routing the call through TS-CAN (which
+> ignores those fields). When this happens, the response includes
+> `method_inferred_from: ["rgb_mode", ...]` so you can tell what
+> triggered the switch. To run TS-CAN with your `rgb_mode=patches`
+> request a no-op (TS-CAN doesn't use it), pass `method=tscan`
+> explicitly.
+
 All endpoints return the same JSON shape:
 
 ```json
