@@ -1,8 +1,23 @@
-# Article-style POS rPPG pipeline
+# Hybrid TS-CAN + article-style POS rPPG pipeline
 
 This is a modernized, usable replacement for the old POS pulse-extraction script.
-It follows the 2025 article's described rPPG estimation setup as closely as possible
-in a standalone script:
+It bundles **two heart-rate estimators** behind a single API and CLI:
+
+- **TS-CAN neural rPPG** — the default. Uses the on-shelf
+  ``UBFC-rPPG_TSCAN.pth`` checkpoint vendored from
+  [rPPG-Toolbox](https://github.com/ubicomplab/rPPG-Toolbox) (Liu et al.,
+  NeurIPS 2020 — *"Multi-Task Temporal Shift Attention Networks for
+  On-Device Contactless Vitals Measurement"*). No per-clip tuning required;
+  the network already learnt to ignore harmonics that fooled the unsupervised
+  POS path. Inference runs on CPU (``torch==2.4.1`` CPU build, ~3 s for a
+  10 s clip).
+- **Article-style POS** — the original Plane-Orthogonal-to-Skin pipeline,
+  kept as the explicit-opt-in / fallback method. Used when a clip is
+  shorter than ~4 s, when ``torch`` is not installed, or when a caller
+  passes ``method=pos`` explicitly.
+
+The POS path follows the 2025 article's described rPPG estimation setup as
+closely as possible in a standalone script:
 
 - MediaPipe Face Mesh instead of dlib's old 68-point predictor.
 - Facial ROI options from the article:
@@ -14,8 +29,23 @@ in a standalone script:
 - 8-second overlapping windows with 1-second stride.
 - 6th-order Butterworth bandpass filter from `0.65` to `4.0` Hz.
 - POS BVP extraction with the 1.6-second POS internal window.
-- Welch PSD BPM estimation in the `0.65` to `4.0` Hz range.
+- Welch PSD BPM estimation in the `0.65` to `4.0` Hz range with
+  3-point parabolic peak interpolation.
+- Variable-frame-rate aware: per-frame ``CAP_PROP_POS_MSEC`` timestamps are
+  read from the video and the RGB trace is resampled onto a uniform grid
+  before POS, so phone-recorded VFR clips don't pull the BPM off.
 - Optional article-style lightweight video modifications.
+
+## Vendored model & licensing
+
+The TS-CAN model architecture (``tscan_inference.py``) and the
+``UBFC-rPPG_TSCAN.pth`` checkpoint under ``models/`` are derived from
+``rPPG-Toolbox`` and redistributed under that project's Responsible AI
+License (RAIL). The full upstream license text is in
+``THIRD_PARTY_LICENSES/rPPG-Toolbox-LICENSE.txt`` — please read it before
+deploying this service in a commercial product. RAIL adds use restrictions
+on top of a permissive base license; in particular it forbids a number of
+medical / surveillance / discriminatory uses.
 
 ## Install
 
@@ -97,9 +127,10 @@ Article-style defaults are `--kernel-size 5`, bilateral sigma values of `75`, an
 
 ## Host as an API on Modal
 
-`modal_app.py` wraps `extract_article_style_pos` in a FastAPI app and serves
-it on [Modal](https://modal.com/) so any client (Python, JavaScript, mobile,
-video-call apps, …) can submit a video and receive a BPM estimate.
+`modal_app.py` wraps the hybrid TS-CAN + POS pipeline (`extract_bpm`) in a
+FastAPI app and serves it on [Modal](https://modal.com/) so any client
+(Python, JavaScript, mobile, video-call apps, …) can submit a video and
+receive a BPM estimate.
 
 ### One-time Modal setup
 
@@ -140,16 +171,17 @@ After deploy you'll get a permanent base URL. The app exposes:
 All `/analyze*` endpoints accept the same optional tuning fields (form fields
 on `/analyze`, JSON keys on the others):
 
-| Field            | Type    | Default | Description                                  |
-|------------------|---------|---------|----------------------------------------------|
-| `roi_mode`       | string  | `face`  | `face`, `selected`, or `full-frame`          |
-| `rgb_mode`       | string  | `patches` | `patches` (100 landmark patches) or `mask` |
-| `patch_size`     | int     | `28`    | Per-landmark patch side length in pixels     |
-| `window_seconds` | float   | `8.0`   | Analysis window length                       |
-| `stride_seconds` | float   | `1.0`   | Analysis window stride                       |
-| `min_hz`         | float   | `0.65`  | Lower band-pass / PSD bound                  |
-| `max_hz`         | float   | `4.0`   | Upper band-pass / PSD bound                  |
-| `max_frames`     | int     | _none_  | Cap on processed frames (latency control)    |
+| Field            | Type    | Default   | Description                                                                                  |
+|------------------|---------|-----------|----------------------------------------------------------------------------------------------|
+| `method`         | string  | `auto`    | `auto` (TS-CAN, fall back to POS), `tscan` (force neural), or `pos` (force the POS path).    |
+| `roi_mode`       | string  | `face`    | POS-only. `face`, `selected`, or `full-frame`.                                               |
+| `rgb_mode`       | string  | `patches` | POS-only. `patches` (100 landmark patches) or `mask`.                                        |
+| `patch_size`     | int     | `28`      | POS-only. Per-landmark patch side length in pixels.                                          |
+| `window_seconds` | float   | `8.0`     | Analysis window length.                                                                      |
+| `stride_seconds` | float   | `1.0`     | Analysis window stride.                                                                      |
+| `min_hz`         | float   | `0.65`    | POS-only. Lower band-pass / PSD bound. TS-CAN uses a fixed `[0.75, 2.5] Hz` band internally. |
+| `max_hz`         | float   | `4.0`     | POS-only. Upper band-pass / PSD bound. TS-CAN uses a fixed `[0.75, 2.5] Hz` band internally. |
+| `max_frames`     | int     | _none_    | Cap on processed frames (latency control).                                                   |
 
 All endpoints return the same JSON shape:
 

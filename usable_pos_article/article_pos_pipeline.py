@@ -98,6 +98,13 @@ class ExtractionSummary:
     median_bpm: float | None
     valid_windows: int
     total_windows: int
+    # New fields (kept at the end so existing JSON consumers are unaffected).
+    # ``method`` records which BVP extractor produced the result — "pos" for
+    # the original article-style POS pipeline, "tscan" for the TS-CAN neural
+    # method. ``fallback_reason`` is set when ``method="auto"`` was requested
+    # but had to fall back from TS-CAN to POS (e.g. clip too short).
+    method: str | None = None
+    fallback_reason: str | None = None
 
 
 class FaceMeshProcessor:
@@ -710,6 +717,230 @@ def extract_article_style_pos(
         valid_windows=int(valid_bpms.size),
         total_windows=len(estimates),
     )
+    return summary, estimates, rgb, bvp
+
+
+# ---------------------------------------------------------------------------
+# Hybrid pipeline: TS-CAN (neural) primary, article-style POS as fallback.
+# ---------------------------------------------------------------------------
+
+# Minimum number of seconds of face frames required for stable TS-CAN
+# inference. Below this we skip TS-CAN and fall back to POS automatically
+# in ``method="auto"`` mode.
+TSCAN_MIN_SECONDS = 4.0
+
+
+def _extract_via_tscan(
+    video_path: Path,
+    window_seconds: float,
+    stride_seconds: float,
+    tscan_low_pass: float,
+    tscan_high_pass: float,
+    max_frames: int | None,
+) -> tuple[ExtractionSummary, list[WindowEstimate], np.ndarray, np.ndarray]:
+    """Run TS-CAN end-to-end and return the same four-tuple as POS."""
+    # Lazy-import torch / the bundled weights so a missing torch wheel doesn't
+    # crash the module import for users who only want POS. ``tscan_inference``
+    # may be either a sibling module (when this file is loaded as a top-level
+    # module by Modal) or a package member (when imported as
+    # ``usable_pos_article.article_pos_pipeline`` in tests); try both.
+    try:
+        from . import tscan_inference  # type: ignore[import-not-found]
+    except ImportError:
+        import tscan_inference  # type: ignore[import-not-found,no-redef]
+
+    fm = FaceMeshProcessor()
+    try:
+        crops, fps, frames_read, frames_with_face, _ = (
+            tscan_inference.read_face_crops_for_tscan(
+                video_path=video_path,
+                face_mesh_processor=fm,
+                target_size=tscan_inference.img_size(),
+                max_frames=max_frames,
+            )
+        )
+    finally:
+        fm.close()
+
+    if crops.shape[0] / float(fps) < TSCAN_MIN_SECONDS:
+        raise RuntimeError(
+            f"TS-CAN needs at least {TSCAN_MIN_SECONDS:g} s of face frames; "
+            f"got {crops.shape[0] / float(fps):.2f} s."
+        )
+
+    bvp = tscan_inference.tscan_bvp_from_crops(
+        crops,
+        fs=fps,
+        low_pass=tscan_low_pass,
+        high_pass=tscan_high_pass,
+    )
+
+    # Build a diagnostic per-frame RGB trace (mean over the 72x72 face crop)
+    # so callers that previously inspected ``rgb`` still get something
+    # meaningful. Truncate to the BVP length so shapes line up.
+    rgb_trace = (crops.reshape(crops.shape[0], -1, 3).mean(axis=1) * 255.0)[: bvp.shape[0]]
+
+    # The TS-CAN BVP is a single coherent signal across the whole clip, so the
+    # natural HR estimate is one whole-clip FFT (this is what the toolbox
+    # papers report). Sliding-window estimates on the *same* BVP are
+    # spectrally correlated and, on ~10 s clips, dominated by the coarse
+    # PSD bin width (fps/nperseg = 0.125 Hz = 7.5 BPM at 8 s @ 30 fps),
+    # which makes the per-window median noisier than the single estimate.
+    # We therefore expose the whole-clip BPM as ``median_bpm`` /
+    # ``mean_bpm``, and additionally surface sliding-window BPMs in the
+    # ``windows`` list for clients that want a per-second view.
+    #
+    # We use a zero-padded FFT periodogram (matching the rPPG-Toolbox
+    # ``_calculate_fft_hr`` reference) instead of the POS-side welch +
+    # flattop-window estimator: with N=290 samples padded to 512, bin width
+    # is 0.0586 Hz = 3.5 BPM, vs. 0.125 Hz / 7.5 BPM for an unpadded
+    # welch flattop window — that finer resolution is needed to keep this
+    # path's truth-band accuracy (~91 BPM on the user's 92-94 BPM clip).
+    whole_bpm = tscan_inference.calculate_fft_hr(
+        bvp, fs=fps, low_pass=tscan_low_pass, high_pass=tscan_high_pass
+    )
+    whole_peak_hz = whole_bpm / 60.0 if math.isfinite(whole_bpm) else float("nan")
+    whole_valid = bool(math.isfinite(whole_bpm))
+
+    window_frames = int(round(window_seconds * fps))
+    stride_frames = max(1, int(round(stride_seconds * fps)))
+    estimates: list[WindowEstimate] = []
+
+    if bvp.shape[0] < window_frames:
+        estimates.append(
+            WindowEstimate(
+                start_s=0.0,
+                center_s=bvp.shape[0] / (2.0 * fps),
+                end_s=bvp.shape[0] / fps,
+                bpm=whole_bpm,
+                peak_hz=whole_peak_hz,
+                valid=whole_valid,
+            )
+        )
+    else:
+        for start in range(0, bvp.shape[0] - window_frames + 1, stride_frames):
+            end = start + window_frames
+            bpm, peak_hz, valid = estimate_window_bpm(
+                bvp, fps, start, end, tscan_low_pass, tscan_high_pass
+            )
+            estimates.append(
+                WindowEstimate(
+                    start_s=start / fps,
+                    center_s=(start + window_frames / 2.0) / fps,
+                    end_s=end / fps,
+                    bpm=bpm,
+                    peak_hz=peak_hz,
+                    valid=valid,
+                )
+            )
+
+    valid_window_bpms = np.array(
+        [e.bpm for e in estimates if e.valid], dtype=np.float64
+    )
+    summary = ExtractionSummary(
+        video=str(video_path),
+        fps=fps,
+        frames_read=frames_read,
+        frames_with_face=frames_with_face,
+        roi_mode="face",
+        rgb_mode="tscan",
+        patch_size=tscan_inference.img_size(),
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        min_hz=tscan_low_pass,
+        max_hz=tscan_high_pass,
+        # For TS-CAN the headline BPM is the whole-clip FFT estimate, not the
+        # per-window median — see comment above.
+        mean_bpm=float(whole_bpm) if whole_valid else None,
+        median_bpm=float(whole_bpm) if whole_valid else None,
+        # Surface valid sliding-window count so clients can still tell that
+        # multi-window analysis succeeded for longer clips.
+        valid_windows=int(valid_window_bpms.size),
+        total_windows=len(estimates),
+        method="tscan",
+    )
+    return summary, estimates, rgb_trace, bvp
+
+
+def extract_bpm(
+    video_path: Path,
+    method: str = "auto",
+    *,
+    # POS-only options (ignored when method="tscan")
+    roi_mode: str = "face",
+    rgb_mode: str = "patches",
+    patch_size: int = 28,
+    min_hz: float = 0.65,
+    max_hz: float = 4.0,
+    # TS-CAN-only options (ignored when method="pos")
+    tscan_low_pass: float = 0.75,
+    tscan_high_pass: float = 2.5,
+    # Shared options
+    window_seconds: float = 8.0,
+    stride_seconds: float = 1.0,
+    max_frames: int | None = None,
+) -> tuple[ExtractionSummary, list[WindowEstimate], np.ndarray, np.ndarray]:
+    """Estimate BPM with the requested method (or pick automatically).
+
+    ``method`` values:
+
+    * ``"auto"`` (default): try TS-CAN first; fall back to article-style POS
+      if the clip is shorter than :data:`TSCAN_MIN_SECONDS`, the TS-CAN model
+      cannot be loaded (e.g. no torch in the environment, no bundled
+      checkpoint), or TS-CAN produces no valid HR windows. The fallback path
+      records the reason in ``summary.fallback_reason``.
+    * ``"tscan"``: run TS-CAN and surface any error.
+    * ``"pos"``: run the existing :func:`extract_article_style_pos` only.
+
+    The return shape is identical to :func:`extract_article_style_pos`: the
+    new ``method`` and ``fallback_reason`` fields on
+    :class:`ExtractionSummary` tell the caller which path produced the
+    answer.
+    """
+    method = method or "auto"
+    if method not in {"auto", "tscan", "pos"}:
+        raise ValueError(
+            f"method must be one of {{'auto', 'tscan', 'pos'}}; got {method!r}"
+        )
+
+    fallback_reason: str | None = None
+
+    if method in {"auto", "tscan"}:
+        try:
+            summary, estimates, rgb, bvp = _extract_via_tscan(
+                video_path=video_path,
+                window_seconds=window_seconds,
+                stride_seconds=stride_seconds,
+                tscan_low_pass=tscan_low_pass,
+                tscan_high_pass=tscan_high_pass,
+                max_frames=max_frames,
+            )
+        except Exception as exc:
+            if method == "tscan":
+                raise
+            # auto: fall through to POS, recording why TS-CAN was skipped.
+            fallback_reason = f"{type(exc).__name__}: {exc}"
+        else:
+            # In auto mode, only accept a TS-CAN result if it produced any
+            # valid windows; otherwise the network output was unusable and
+            # POS is the better bet.
+            if method == "tscan" or summary.valid_windows > 0:
+                return summary, estimates, rgb, bvp
+            fallback_reason = "tscan_no_valid_windows"
+
+    summary, estimates, rgb, bvp = extract_article_style_pos(
+        video_path=video_path,
+        roi_mode=roi_mode,
+        rgb_mode=rgb_mode,
+        patch_size=patch_size,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        min_hz=min_hz,
+        max_hz=max_hz,
+        max_frames=max_frames,
+    )
+    summary.method = "pos"
+    summary.fallback_reason = fallback_reason
     return summary, estimates, rgb, bvp
 
 

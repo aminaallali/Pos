@@ -28,14 +28,25 @@ All ``/analyze*`` endpoints accept the same optional tuning parameters either
 as form fields (``/analyze``) or as JSON keys (``/analyze-url``,
 ``/analyze-base64``):
 
-* ``roi_mode``       - ``face`` | ``selected`` | ``full-frame`` (default ``face``)
-* ``rgb_mode``       - ``patches`` | ``mask`` (default ``patches``)
-* ``patch_size``     - int, default ``28``
-* ``window_seconds`` - float, default ``8.0``
-* ``stride_seconds`` - float, default ``1.0``
-* ``min_hz``         - float, default ``0.65``
-* ``max_hz``         - float, default ``4.0``
-* ``max_frames``     - optional int cap on processed frames
+* ``method``         - ``auto`` | ``tscan`` | ``pos`` (default ``auto``).
+                       ``auto`` runs the TS-CAN neural pipeline first and
+                       falls back to article-style POS only if TS-CAN cannot
+                       be loaded or the clip is shorter than ~4 s. ``tscan``
+                       forces the neural path; ``pos`` forces the legacy
+                       POS path (the original ``/analyze`` behaviour).
+* ``roi_mode``       - ``face`` | ``selected`` | ``full-frame`` (default ``face``).
+                       Only used by the POS path.
+* ``rgb_mode``       - ``patches`` | ``mask`` (default ``patches``).
+                       Only used by the POS path.
+* ``patch_size``     - int, default ``28``. Only used by the POS path.
+* ``window_seconds`` - float, default ``8.0``.
+* ``stride_seconds`` - float, default ``1.0``.
+* ``min_hz``         - float, default ``0.65``. Only used by the POS path.
+* ``max_hz``         - float, default ``4.0``. Only used by the POS path.
+                       The TS-CAN path uses a fixed ``[0.75, 2.5] Hz`` band
+                       (45-150 BPM) so callers do not need to tune it
+                       per-clip.
+* ``max_frames``     - optional int cap on processed frames.
 
 They all return the same JSON schema::
 
@@ -65,6 +76,7 @@ They all return the same JSON schema::
 """
 
 import math
+from pathlib import Path
 
 import modal
 
@@ -92,10 +104,28 @@ image = (
         "fastapi[standard]==0.115.4",
         "python-multipart==0.0.12",
         "requests==2.32.3",
+        # PyTorch CPU build for the TS-CAN neural rPPG path. The CPU wheel
+        # is ~250 MB; we install it from the public CPU index to avoid
+        # pulling the 2 GB CUDA build.
+        "torch==2.4.1",
+        extra_options="--index-url https://download.pytorch.org/whl/cpu",
     )
     # ``add_local_*`` must be the final layer in the chain (Modal rejects
     # Images that have any non-add_local_* build step after one).
-    .add_local_python_source("article_pos_pipeline")
+    .add_local_python_source("article_pos_pipeline", "tscan_inference")
+    # Bundle the pretrained TS-CAN checkpoint and license attribution into
+    # the image. ``/root`` is the working directory in Modal containers,
+    # which is where ``add_local_python_source`` puts the modules above; we
+    # mirror the layout from the source tree so ``tscan_inference`` finds
+    # the weights at the same relative path it does locally.
+    .add_local_dir(
+        Path(__file__).resolve().parent / "models",
+        remote_path="/root/models",
+    )
+    .add_local_dir(
+        Path(__file__).resolve().parent / "THIRD_PARTY_LICENSES",
+        remote_path="/root/THIRD_PARTY_LICENSES",
+    )
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -136,7 +166,7 @@ def fastapi_app():
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
 
-    from article_pos_pipeline import extract_article_style_pos
+    from article_pos_pipeline import extract_bpm
 
     web_app = FastAPI(
         title="POS rPPG BPM API",
@@ -156,6 +186,7 @@ def fastapi_app():
     )
 
     DEFAULTS: dict[str, Any] = {
+        "method": "auto",
         "roi_mode": "face",
         "rgb_mode": "patches",
         "patch_size": 28,
@@ -166,15 +197,17 @@ def fastapi_app():
         "max_frames": None,
     }
 
+    ALLOWED_METHOD = {"auto", "tscan", "pos"}
     ALLOWED_ROI = {"face", "selected", "full-frame"}
     ALLOWED_RGB = {"patches", "mask"}
 
     # When a user clicks "Try it out" → "Execute" in Swagger UI without filling
     # in the optional fields, Swagger submits the schema's *placeholder* as the
-    # actual value (e.g. ``roi_mode=string``, ``patch_size=0``). None of these
+    # actual value (e.g. ``method=string``, ``patch_size=0``). None of these
     # placeholder values are valid for any field below, so treat them as
     # "not provided" and fall back to the documented defaults.
     SWAGGER_PLACEHOLDERS: dict[str, set[Any]] = {
+        "method": {"", "string"},
         "roi_mode": {"", "string"},
         "rgb_mode": {"", "string"},
         "patch_size": {0},
@@ -195,6 +228,11 @@ def fastapi_app():
                 continue
             opts[key] = value
 
+        if opts["method"] not in ALLOWED_METHOD:
+            raise HTTPException(
+                status_code=400,
+                detail=f"method must be one of {sorted(ALLOWED_METHOD)}",
+            )
         if opts["roi_mode"] not in ALLOWED_ROI:
             raise HTTPException(
                 status_code=400,
@@ -239,8 +277,9 @@ def fastapi_app():
 
     def _run_pipeline(video_path: Path, opts: dict[str, Any]) -> dict[str, Any]:
         try:
-            summary, estimates, _, _ = extract_article_style_pos(
+            summary, estimates, _, _ = extract_bpm(
                 video_path=video_path,
+                method=opts["method"],
                 roi_mode=opts["roi_mode"],
                 rgb_mode=opts["rgb_mode"],
                 patch_size=opts["patch_size"],
@@ -294,10 +333,14 @@ def fastapi_app():
     def root() -> dict[str, Any]:
         return {
             "service": "POS rPPG BPM API",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "algorithm": (
-                "Plane-Orthogonal-to-Skin (POS) rPPG, "
-                "Wang et al., IEEE TBME 2017"
+                "Hybrid: TS-CAN neural rPPG (Liu et al., NeurIPS 2020, "
+                "UBFC-rPPG pretrained checkpoint from rPPG-Toolbox) as "
+                "the default method, with article-style "
+                "Plane-Orthogonal-to-Skin (POS) rPPG "
+                "(Wang et al., IEEE TBME 2017) as the fallback / "
+                "explicit-opt-in method."
             ),
             "endpoints": {
                 "GET /": "this metadata",
@@ -326,6 +369,7 @@ def fastapi_app():
     @web_app.post("/analyze")
     async def analyze(
         video: Annotated[UploadFile, File(...)],
+        method: Annotated[str | None, Form()] = None,
         roi_mode: Annotated[str | None, Form()] = None,
         rgb_mode: Annotated[str | None, Form()] = None,
         patch_size: Annotated[int | None, Form()] = None,
@@ -340,6 +384,7 @@ def fastapi_app():
 
         opts = _validated_options(
             {
+                "method": method,
                 "roi_mode": roi_mode,
                 "rgb_mode": rgb_mode,
                 "patch_size": patch_size,
