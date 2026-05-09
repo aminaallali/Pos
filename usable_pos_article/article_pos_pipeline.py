@@ -98,6 +98,25 @@ class ExtractionSummary:
     median_bpm: float | None
     valid_windows: int
     total_windows: int
+    # New fields (kept at the end so existing JSON consumers are unaffected).
+    # ``method`` records which BVP extractor produced the result — "pos" for
+    # the original article-style POS pipeline, "tscan" for the TS-CAN neural
+    # method, or "consensus" for the multi-method rPPG-VQA aggregator.
+    # ``fallback_reason`` is set when ``method="auto"`` was requested but had
+    # to fall back from TS-CAN to POS (e.g. clip too short).
+    method: str | None = None
+    fallback_reason: str | None = None
+    # Consensus-only fields. Populated only when ``method="consensus"``.
+    # ``q_sig`` is the unified signal-quality score in [0, 1] (Eq. 4 / 8 of
+    # rPPG-VQA). ``consensus_verdict`` is "accepted" or "rejected".
+    # ``consensus_methods`` is a per-algorithm breakdown the API surfaces
+    # alongside the headline BPM.
+    q_sig: float | None = None
+    consensus_verdict: str | None = None
+    consensus_inliers: int | None = None
+    inlier_std_bpm: float | None = None
+    consensus_rejection_reason: str | None = None
+    consensus_methods: list[dict] | None = None
 
 
 class FaceMeshProcessor:
@@ -308,6 +327,74 @@ def rgb_from_mask(
     return pixels.mean(axis=0).astype(np.float64)
 
 
+def _resample_to_uniform_grid(
+    trace: np.ndarray,
+    timestamps_s: np.ndarray,
+    fallback_fps: float,
+) -> tuple[np.ndarray, float]:
+    """Resample a per-frame trace onto a uniform time grid.
+
+    Phone-recorded videos are very often variable-frame-rate: the camera
+    drops or doubles up frames, but ``cv2.VideoCapture.get(CAP_PROP_FPS)``
+    only exposes a single nominal rate. Treating that nominal rate as the
+    true sampling rate stretches the spectrum and shifts the BPM peak. We
+    use the per-frame ``CAP_PROP_POS_MSEC`` timestamps to detect the actual
+    median frame interval and resample the trace onto that uniform grid.
+
+    ``trace`` may be 2-D ``(frames, channels)`` or 3-D
+    ``(frames, estimators, channels)``. If the timestamps are unusable
+    (all zero, non-monotonic, or too few distinct values), the original
+    trace and ``fallback_fps`` are returned unchanged.
+    """
+    timestamps_s = np.asarray(timestamps_s, dtype=np.float64)
+    if timestamps_s.size != trace.shape[0] or timestamps_s.size < 2:
+        return trace, fallback_fps
+
+    # Some backends report POS_MSEC as non-strictly-monotonic on the first
+    # few frames; force monotonicity before computing dt.
+    timestamps_s = np.maximum.accumulate(timestamps_s)
+    diffs = np.diff(timestamps_s)
+    valid_diffs = diffs[diffs > 0]
+    if valid_diffs.size < max(2, trace.shape[0] // 4):
+        return trace, fallback_fps
+
+    median_dt = float(np.median(valid_diffs))
+    if median_dt <= 0 or not math.isfinite(median_dt):
+        return trace, fallback_fps
+    target_fps = 1.0 / median_dt
+    span = float(timestamps_s[-1] - timestamps_s[0])
+    if span <= 0 or not math.isfinite(target_fps):
+        return trace, fallback_fps
+
+    n_new = max(2, int(round(span * target_fps)) + 1)
+    new_ts = timestamps_s[0] + np.arange(n_new, dtype=np.float64) / target_fps
+
+    if trace.ndim == 2:
+        resampled = np.empty((n_new, trace.shape[1]), dtype=np.float64)
+        for c in range(trace.shape[1]):
+            resampled[:, c] = np.interp(new_ts, timestamps_s, trace[:, c])
+        return resampled, target_fps
+
+    if trace.ndim == 3:
+        n_frames, n_est, n_ch = trace.shape
+        flat = trace.reshape(n_frames, -1)
+        out_flat = np.empty((n_new, flat.shape[1]), dtype=np.float64)
+        for col in range(flat.shape[1]):
+            y = flat[:, col]
+            finite = np.isfinite(y)
+            if not np.any(finite):
+                out_flat[:, col] = np.nan
+            elif finite.all():
+                out_flat[:, col] = np.interp(new_ts, timestamps_s, y)
+            else:
+                out_flat[:, col] = np.interp(
+                    new_ts, timestamps_s[finite], y[finite]
+                )
+        return out_flat.reshape(n_new, n_est, n_ch), target_fps
+
+    return trace, fallback_fps
+
+
 def read_rgb_trace(
     video_path: Path,
     roi_mode: str,
@@ -325,6 +412,7 @@ def read_rgb_trace(
 
     processor = FaceMeshProcessor()
     rgb_values: list[np.ndarray] = []
+    timestamps: list[float] = []
     frames_read = 0
     frames_with_face = 0
 
@@ -332,6 +420,8 @@ def read_rgb_trace(
         while True:
             if max_frames is not None and frames_read >= max_frames:
                 break
+            # POS_MSEC before read() = time of the frame about to be read.
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -357,13 +447,17 @@ def read_rgb_trace(
 
             if rgb is not None and np.all(np.isfinite(rgb)):
                 rgb_values.append(rgb)
+                timestamps.append(pos_msec / 1000.0)
     finally:
         processor.close()
         cap.release()
 
     if not rgb_values:
         raise RuntimeError("No valid RGB samples were extracted. Check video visibility and face detection.")
-    return np.vstack(rgb_values), fps, frames_read, frames_with_face
+    rgb_arr = np.vstack(rgb_values)
+    ts_arr = np.asarray(timestamps, dtype=np.float64)
+    rgb_resampled, effective_fps = _resample_to_uniform_grid(rgb_arr, ts_arr, fps)
+    return rgb_resampled, effective_fps, frames_read, frames_with_face
 
 
 def read_patch_estimator_trace(
@@ -381,6 +475,7 @@ def read_patch_estimator_trace(
 
     processor = FaceMeshProcessor()
     traces: list[np.ndarray] = []
+    timestamps: list[float] = []
     frames_read = 0
     frames_with_face = 0
 
@@ -388,6 +483,8 @@ def read_patch_estimator_trace(
         while True:
             if max_frames is not None and frames_read >= max_frames:
                 break
+            # POS_MSEC before read() = time of the frame about to be read.
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -402,13 +499,17 @@ def read_patch_estimator_trace(
             estimators = patch_rgb_estimators(frame_rgb, landmarks, patch_size=patch_size)
             if estimators is not None:
                 traces.append(estimators)
+                timestamps.append(pos_msec / 1000.0)
     finally:
         processor.close()
         cap.release()
 
     if not traces:
         raise RuntimeError("No valid patch RGB samples were extracted. Check video visibility and face detection.")
-    return np.stack(traces, axis=0), fps, frames_read, frames_with_face
+    trace_arr = np.stack(traces, axis=0)
+    ts_arr = np.asarray(timestamps, dtype=np.float64)
+    trace_resampled, effective_fps = _resample_to_uniform_grid(trace_arr, ts_arr, fps)
+    return trace_resampled, effective_fps, frames_read, frames_with_face
 
 
 def bandpass_filter(signal: np.ndarray, fps: float, min_hz: float, max_hz: float, order: int = 6) -> np.ndarray:
@@ -495,8 +596,11 @@ def article_style_patch_bvp(
         if np.std(rgb) <= np.finfo(np.float64).eps:
             continue
         try:
-            rgb_filtered = bandpass_filter(rgb, fps, min_hz, max_hz)
-            bvp = pos_bvp(rgb_filtered, fps)
+            # POS is illumination-invariant by construction (the c / mean(c)
+            # step), so the paper applies the bandpass *only* after POS.
+            # Filtering the RGB beforehand strips the DC component POS uses
+            # to compute the chrominance projection cleanly.
+            bvp = pos_bvp(rgb, fps)
             bvp = bandpass_filter(bvp, fps, min_hz, max_hz)
         except ValueError:
             continue
@@ -529,8 +633,23 @@ def estimate_window_bpm(
     candidates = np.where((freqs >= min_hz) & (freqs <= max_hz))[0]
     if candidates.size == 0:
         return float("nan"), float("nan"), False
-    peak_idx = candidates[np.argmax(psd[candidates])]
+    peak_idx = int(candidates[np.argmax(psd[candidates])])
     peak_hz = float(freqs[peak_idx])
+
+    # 3-point parabolic interpolation around the PSD peak gives sub-bin
+    # frequency resolution. Without it, the maximum achievable BPM
+    # resolution is the bin width fps / nperseg, which for an 8 s window at
+    # 30 fps is 0.125 Hz = 7.5 BPM.
+    if 0 < peak_idx < len(psd) - 1:
+        p0, p1, p2 = float(psd[peak_idx - 1]), float(psd[peak_idx]), float(psd[peak_idx + 1])
+        denom = p0 - 2.0 * p1 + p2
+        if denom != 0.0:
+            delta = 0.5 * (p0 - p2) / denom
+            if -1.0 < delta < 1.0:
+                df = float(freqs[1] - freqs[0])
+                refined = peak_hz + delta * df
+                if min_hz <= refined <= max_hz:
+                    peak_hz = refined
     return peak_hz * 60.0, peak_hz, True
 
 
@@ -562,8 +681,12 @@ def extract_article_style_pos(
             max_frames=max_frames,
         )
         rgb = interpolate_nans(rgb)
-        rgb_filtered = bandpass_filter(rgb, fps, min_hz, max_hz)
-        bvp = pos_bvp(rgb_filtered, fps)
+        # POS is illumination-invariant by construction (the c / mean(c)
+        # step), so the paper applies the bandpass *only* after POS.
+        # Filtering the RGB beforehand strips the DC component POS uses
+        # to compute the chrominance projection cleanly. Same change as in
+        # article_style_patch_bvp above; applies to rgb_mode="mask" here.
+        bvp = pos_bvp(rgb, fps)
         bvp = bandpass_filter(bvp, fps, min_hz, max_hz)
 
     window_frames = int(round(window_seconds * fps))
@@ -606,6 +729,362 @@ def extract_article_style_pos(
         valid_windows=int(valid_bpms.size),
         total_windows=len(estimates),
     )
+    return summary, estimates, rgb, bvp
+
+
+# ---------------------------------------------------------------------------
+# Hybrid pipeline: TS-CAN (neural) primary, article-style POS as fallback.
+# ---------------------------------------------------------------------------
+
+# Minimum number of seconds of face frames required for stable TS-CAN
+# inference. Below this we skip TS-CAN and fall back to POS automatically
+# in ``method="auto"`` mode.
+TSCAN_MIN_SECONDS = 4.0
+
+
+def _extract_via_tscan(
+    video_path: Path,
+    window_seconds: float,
+    stride_seconds: float,
+    tscan_low_pass: float,
+    tscan_high_pass: float,
+    max_frames: int | None,
+) -> tuple[ExtractionSummary, list[WindowEstimate], np.ndarray, np.ndarray]:
+    """Run TS-CAN end-to-end and return the same four-tuple as POS."""
+    # Lazy-import torch / the bundled weights so a missing torch wheel doesn't
+    # crash the module import for users who only want POS. ``tscan_inference``
+    # may be either a sibling module (when this file is loaded as a top-level
+    # module by Modal) or a package member (when imported as
+    # ``usable_pos_article.article_pos_pipeline`` in tests); try both.
+    try:
+        from . import tscan_inference  # type: ignore[import-not-found]
+    except ImportError:
+        import tscan_inference  # type: ignore[import-not-found,no-redef]
+
+    fm = FaceMeshProcessor()
+    try:
+        crops, fps, frames_read, frames_with_face, _ = (
+            tscan_inference.read_face_crops_for_tscan(
+                video_path=video_path,
+                face_mesh_processor=fm,
+                target_size=tscan_inference.img_size(),
+                max_frames=max_frames,
+            )
+        )
+    finally:
+        fm.close()
+
+    if crops.shape[0] / float(fps) < TSCAN_MIN_SECONDS:
+        raise RuntimeError(
+            f"TS-CAN needs at least {TSCAN_MIN_SECONDS:g} s of face frames; "
+            f"got {crops.shape[0] / float(fps):.2f} s."
+        )
+
+    bvp = tscan_inference.tscan_bvp_from_crops(
+        crops,
+        fs=fps,
+        low_pass=tscan_low_pass,
+        high_pass=tscan_high_pass,
+    )
+
+    # Build a diagnostic per-frame RGB trace (mean over the 72x72 face crop)
+    # so callers that previously inspected ``rgb`` still get something
+    # meaningful. Truncate to the BVP length so shapes line up.
+    rgb_trace = (crops.reshape(crops.shape[0], -1, 3).mean(axis=1) * 255.0)[: bvp.shape[0]]
+
+    # The TS-CAN BVP is a single coherent signal across the whole clip, so the
+    # natural HR estimate is one whole-clip FFT (this is what the toolbox
+    # papers report). Sliding-window estimates on the *same* BVP are
+    # spectrally correlated and, on ~10 s clips, dominated by the coarse
+    # PSD bin width (fps/nperseg = 0.125 Hz = 7.5 BPM at 8 s @ 30 fps),
+    # which makes the per-window median noisier than the single estimate.
+    # We therefore expose the whole-clip BPM as ``median_bpm`` /
+    # ``mean_bpm``, and additionally surface sliding-window BPMs in the
+    # ``windows`` list for clients that want a per-second view.
+    #
+    # We use a zero-padded FFT periodogram (matching the rPPG-Toolbox
+    # ``_calculate_fft_hr`` reference) instead of the POS-side welch +
+    # flattop-window estimator: with N=290 samples padded to 512, bin width
+    # is 0.0586 Hz = 3.5 BPM, vs. 0.125 Hz / 7.5 BPM for an unpadded
+    # welch flattop window — that finer resolution is needed to keep this
+    # path's truth-band accuracy (~91 BPM on the user's 92-94 BPM clip).
+    whole_bpm = tscan_inference.calculate_fft_hr(
+        bvp, fs=fps, low_pass=tscan_low_pass, high_pass=tscan_high_pass
+    )
+    whole_peak_hz = whole_bpm / 60.0 if math.isfinite(whole_bpm) else float("nan")
+    whole_valid = bool(math.isfinite(whole_bpm))
+
+    window_frames = int(round(window_seconds * fps))
+    stride_frames = max(1, int(round(stride_seconds * fps)))
+    estimates: list[WindowEstimate] = []
+
+    if bvp.shape[0] < window_frames:
+        estimates.append(
+            WindowEstimate(
+                start_s=0.0,
+                center_s=bvp.shape[0] / (2.0 * fps),
+                end_s=bvp.shape[0] / fps,
+                bpm=whole_bpm,
+                peak_hz=whole_peak_hz,
+                valid=whole_valid,
+            )
+        )
+    else:
+        for start in range(0, bvp.shape[0] - window_frames + 1, stride_frames):
+            end = start + window_frames
+            bpm, peak_hz, valid = estimate_window_bpm(
+                bvp, fps, start, end, tscan_low_pass, tscan_high_pass
+            )
+            estimates.append(
+                WindowEstimate(
+                    start_s=start / fps,
+                    center_s=(start + window_frames / 2.0) / fps,
+                    end_s=end / fps,
+                    bpm=bpm,
+                    peak_hz=peak_hz,
+                    valid=valid,
+                )
+            )
+
+    valid_window_bpms = np.array(
+        [e.bpm for e in estimates if e.valid], dtype=np.float64
+    )
+    summary = ExtractionSummary(
+        video=str(video_path),
+        fps=fps,
+        frames_read=frames_read,
+        frames_with_face=frames_with_face,
+        roi_mode="face",
+        rgb_mode="tscan",
+        patch_size=tscan_inference.img_size(),
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        min_hz=tscan_low_pass,
+        max_hz=tscan_high_pass,
+        # For TS-CAN the headline BPM is the whole-clip FFT estimate, not the
+        # per-window median — see comment above.
+        mean_bpm=float(whole_bpm) if whole_valid else None,
+        median_bpm=float(whole_bpm) if whole_valid else None,
+        # Surface valid sliding-window count so clients can still tell that
+        # multi-window analysis succeeded for longer clips.
+        valid_windows=int(valid_window_bpms.size),
+        total_windows=len(estimates),
+        method="tscan",
+    )
+    return summary, estimates, rgb_trace, bvp
+
+
+def _extract_via_consensus(
+    video_path: Path,
+    roi_mode: str,
+    rgb_mode: str,
+    patch_size: int,
+    min_hz: float,
+    max_hz: float,
+    window_seconds: float,
+    stride_seconds: float,
+    max_frames: int | None,
+) -> tuple[ExtractionSummary, list[WindowEstimate], np.ndarray, np.ndarray]:
+    """Run the rPPG-VQA-style multi-method consensus pipeline.
+
+    Reuses :func:`read_rgb_trace` (with the caller's ROI / RGB-mode choices)
+    to produce a uniform-grid RGB trace, then hands it to
+    :func:`consensus_inference.consensus_bpm` which runs all seven classical
+    algorithms (POS, CHROM, GREEN, ICA, LGI, PBV, OMIT) and combines them via
+    the frequency-consistency + spectral-correlation weighting scheme.
+
+    Returns the same four-tuple as the other backends. The headline BPM and
+    quality fields end up in ``summary``; ``estimates`` contains a single
+    whole-clip ``WindowEstimate`` so existing per-window UI keeps working.
+    """
+    try:
+        from . import consensus_inference  # type: ignore[import-not-found]
+    except ImportError:
+        import consensus_inference  # type: ignore[import-not-found,no-redef]
+
+    # When the caller wants per-patch processing, run each consensus
+    # algorithm on every face-skin patch independently and median-aggregate
+    # across patches \u2014 this lifts the same motion robustness that the
+    # article-style POS pipeline already enjoys onto every classical method
+    # in the consensus.
+    patch_trace: np.ndarray | None = None
+    if rgb_mode == "patches":
+        patch_trace, fps, frames_read, frames_with_face = read_patch_estimator_trace(
+            video_path=video_path,
+            patch_size=patch_size,
+            max_frames=max_frames,
+        )
+        rgb = interpolate_nans(np.nanmean(patch_trace, axis=1))
+    else:
+        rgb, fps, frames_read, frames_with_face = read_rgb_trace(
+            video_path=video_path,
+            roi_mode=roi_mode,
+            rgb_mode=rgb_mode,
+            patch_size=patch_size,
+            max_frames=max_frames,
+        )
+        rgb = interpolate_nans(rgb)
+
+    result = consensus_inference.consensus_bpm(
+        rgb=rgb,
+        fps=fps,
+        min_hz=min_hz,
+        max_hz=max_hz,
+        patch_trace=patch_trace,
+    )
+
+    bpm = float(result.bpm) if math.isfinite(result.bpm) else float("nan")
+    valid = bool(math.isfinite(bpm) and bpm > 0)
+    duration = rgb.shape[0] / max(fps, 1e-6)
+    estimates = [
+        WindowEstimate(
+            start_s=0.0,
+            center_s=duration / 2.0,
+            end_s=duration,
+            bpm=bpm,
+            peak_hz=bpm / 60.0 if math.isfinite(bpm) else float("nan"),
+            valid=valid,
+        )
+    ]
+    summary = ExtractionSummary(
+        video=str(video_path),
+        fps=fps,
+        frames_read=frames_read,
+        frames_with_face=frames_with_face,
+        roi_mode=roi_mode,
+        rgb_mode=rgb_mode,
+        patch_size=patch_size,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        min_hz=min_hz,
+        max_hz=max_hz,
+        mean_bpm=bpm if valid else None,
+        median_bpm=bpm if valid else None,
+        valid_windows=int(valid),
+        total_windows=1,
+        method="consensus",
+        q_sig=float(result.q_sig),
+        consensus_verdict=result.verdict,
+        consensus_inliers=result.consensus_inliers,
+        inlier_std_bpm=float(result.inlier_std_bpm),
+        consensus_rejection_reason=result.rejection_reason,
+        consensus_methods=[
+            {
+                "name": m.name,
+                "bpm": float(m.bpm) if math.isfinite(m.bpm) else None,
+                "snr_db": (
+                    float(m.snr_db) if math.isfinite(m.snr_db) else None
+                ),
+                "weight": float(m.weight),
+                "weight_freq": float(m.weight_freq),
+                "weight_corr": float(m.weight_corr),
+                "inlier": bool(m.inlier),
+                "error": m.error,
+            }
+            for m in result.methods
+        ],
+    )
+    return summary, estimates, rgb, np.zeros(rgb.shape[0])
+
+
+def extract_bpm(
+    video_path: Path,
+    method: str = "auto",
+    *,
+    # POS-only options (ignored when method="tscan")
+    roi_mode: str = "face",
+    rgb_mode: str = "patches",
+    patch_size: int = 28,
+    min_hz: float = 0.65,
+    max_hz: float = 4.0,
+    # TS-CAN-only options (ignored when method="pos")
+    tscan_low_pass: float = 0.75,
+    tscan_high_pass: float = 2.5,
+    # Shared options
+    window_seconds: float = 8.0,
+    stride_seconds: float = 1.0,
+    max_frames: int | None = None,
+) -> tuple[ExtractionSummary, list[WindowEstimate], np.ndarray, np.ndarray]:
+    """Estimate BPM with the requested method (or pick automatically).
+
+    ``method`` values:
+
+    * ``"auto"`` (default): try TS-CAN first; fall back to article-style POS
+      if the clip is shorter than :data:`TSCAN_MIN_SECONDS`, the TS-CAN model
+      cannot be loaded (e.g. no torch in the environment, no bundled
+      checkpoint), or TS-CAN produces no valid HR windows. The fallback path
+      records the reason in ``summary.fallback_reason``.
+    * ``"tscan"``: run TS-CAN and surface any error.
+    * ``"pos"``: run the existing :func:`extract_article_style_pos` only.
+    * ``"consensus"``: run all seven classical rPPG algorithms (POS, CHROM,
+      GREEN, ICA, LGI, PBV, OMIT) on the same RGB trace and combine them
+      with the rPPG-VQA frequency-consistency + spectral-correlation
+      weighting. Surfaces a ``q_sig`` quality score and a per-algorithm
+      breakdown alongside the headline BPM.
+
+    The return shape is identical to :func:`extract_article_style_pos`: the
+    new ``method`` and ``fallback_reason`` fields on
+    :class:`ExtractionSummary` tell the caller which path produced the
+    answer.
+    """
+    method = method or "auto"
+    if method not in {"auto", "tscan", "pos", "consensus"}:
+        raise ValueError(
+            f"method must be one of "
+            f"{{'auto', 'tscan', 'pos', 'consensus'}}; got {method!r}"
+        )
+
+    if method == "consensus":
+        return _extract_via_consensus(
+            video_path=video_path,
+            roi_mode=roi_mode,
+            rgb_mode=rgb_mode,
+            patch_size=patch_size,
+            min_hz=min_hz,
+            max_hz=max_hz,
+            window_seconds=window_seconds,
+            stride_seconds=stride_seconds,
+            max_frames=max_frames,
+        )
+
+    fallback_reason: str | None = None
+
+    if method in {"auto", "tscan"}:
+        try:
+            summary, estimates, rgb, bvp = _extract_via_tscan(
+                video_path=video_path,
+                window_seconds=window_seconds,
+                stride_seconds=stride_seconds,
+                tscan_low_pass=tscan_low_pass,
+                tscan_high_pass=tscan_high_pass,
+                max_frames=max_frames,
+            )
+        except Exception as exc:
+            if method == "tscan":
+                raise
+            # auto: fall through to POS, recording why TS-CAN was skipped.
+            fallback_reason = f"{type(exc).__name__}: {exc}"
+        else:
+            # In auto mode, only accept a TS-CAN result if it produced any
+            # valid windows; otherwise the network output was unusable and
+            # POS is the better bet.
+            if method == "tscan" or summary.valid_windows > 0:
+                return summary, estimates, rgb, bvp
+            fallback_reason = "tscan_no_valid_windows"
+
+    summary, estimates, rgb, bvp = extract_article_style_pos(
+        video_path=video_path,
+        roi_mode=roi_mode,
+        rgb_mode=rgb_mode,
+        patch_size=patch_size,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        min_hz=min_hz,
+        max_hz=max_hz,
+        max_frames=max_frames,
+    )
+    summary.method = "pos"
+    summary.fallback_reason = fallback_reason
     return summary, estimates, rgb, bvp
 
 
