@@ -80,7 +80,7 @@ MODEL_CACHE_PATH = "/root/.cache/article_pos_pipeline/face_landmarker.task"
 # The processing function caps the request body at this size. Larger uploads
 # should use ``/analyze-url`` so Modal streams the bytes directly from object
 # storage.
-MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
 
 # Hard ceiling on how long a single request is allowed to run. Long videos can
 # be expensive; clients should pass ``max_frames`` to keep latency bounded.
