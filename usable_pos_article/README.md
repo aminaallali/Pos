@@ -362,7 +362,7 @@ python client_example.py from-url --url "$BASE_URL" --video-url https://example.
 
 ### Limits / production notes
 
-* `MAX_UPLOAD_BYTES = 200 MB` for `multipart/form-data` and base64 uploads.
+* `MAX_UPLOAD_BYTES = 500 MB` for `multipart/form-data` and base64 uploads.
   Larger payloads should use `/analyze-url`.
 * `REQUEST_TIMEOUT_SECONDS = 600`. To keep tail latency bounded, pass
   `max_frames` (e.g. analyze a rolling 30 s window for live calls).
